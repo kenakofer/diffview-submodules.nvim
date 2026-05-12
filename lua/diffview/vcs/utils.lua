@@ -72,6 +72,14 @@ M.diff_file_list = async.wrap(function(adapter, left, right, path_args, dv_opt, 
   local rev_args = adapter:rev_to_args(left, right)
   local errors = {}
 
+  -- Pre-warm: kick off the dirty-submodule check early so it runs in
+  -- parallel with the parent tracked/untracked collection below.
+  local dirty_sub_waitable
+  if adapter.dirty_submodule_paths then
+    dirty_sub_waitable = adapter:dirty_submodule_paths(path_args)
+  end
+
+  -- Collect working files (parent tracked + untracked)
   ;(function()
     local err, tfiles, tconflicts = await(
       adapter:tracked_files(
@@ -91,20 +99,6 @@ M.diff_file_list = async.wrap(function(adapter, left, right, path_args, dv_opt, 
 
     files:set_working(tfiles)
     files:set_conflicting(tconflicts)
-
-    if adapter.submodule_files then
-      local sub_err, sub_files, sub_conflicts = await(
-        adapter:submodule_files(left, right, path_args, "working", opt)
-      )
-
-      if sub_err then
-        errors[#errors+1] = sub_err
-        utils.err("Failed to get git status for submodule files!", true)
-      else
-        files:set_working(utils.vec_join(files.working, sub_files))
-        files:set_conflicting(utils.vec_join(files.conflicting, sub_conflicts))
-      end
-    end
 
     if not adapter:show_untracked({
         dv_opt = dv_opt,
@@ -127,6 +121,8 @@ M.diff_file_list = async.wrap(function(adapter, left, right, path_args, dv_opt, 
     end
   end)()
 
+  -- Collect staged files (parent)
+  local staged_files
   if left.type == RevType.STAGE and right.type == RevType.LOCAL then
     local left_rev = adapter:head_rev() or adapter.Rev.new_null_tree()
     local right_rev = adapter.Rev(RevType.STAGE, 0)
@@ -145,19 +141,52 @@ M.diff_file_list = async.wrap(function(adapter, left, right, path_args, dv_opt, 
       errors[#errors+1] = err
       utils.err("Failed to get git status for staged files!", true)
     else
+      staged_files = { left_rev = left_rev, right_rev = right_rev, tfiles = tfiles }
       files:set_staged(tfiles)
+    end
+  end
 
-      if adapter.submodule_files then
-        local sub_err, sub_files = await(
-          adapter:submodule_files(left_rev, right_rev, path_args, "staged", opt)
-        )
+  -- Resolve the pre-warmed dirty check so the cache is primed before
+  -- submodule_files is called (it will hit the TTL cache).
+  if dirty_sub_waitable then
+    await(dirty_sub_waitable)
+  end
 
-        if sub_err then
-          errors[#errors+1] = sub_err
-          utils.err("Failed to get git status for staged submodule files!", true)
-        else
-          files:set_staged(utils.vec_join(files.staged, sub_files))
-        end
+  -- Collect submodule files for both working and staged concurrently.
+  if adapter.submodule_files then
+    local sub_working_waitable
+    local sub_staged_waitable
+
+    -- Start working submodule collection
+    sub_working_waitable = adapter:submodule_files(left, right, path_args, "working", opt)
+
+    -- Start staged submodule collection (if applicable)
+    if staged_files then
+      sub_staged_waitable = adapter:submodule_files(
+        staged_files.left_rev, staged_files.right_rev, path_args, "staged", opt
+      )
+    end
+
+    -- Await working submodule results
+    if sub_working_waitable then
+      local sub_err, sub_files, sub_conflicts = await(sub_working_waitable)
+      if sub_err then
+        errors[#errors+1] = sub_err
+        utils.err("Failed to get git status for submodule files!", true)
+      else
+        files:set_working(utils.vec_join(files.working, sub_files))
+        files:set_conflicting(utils.vec_join(files.conflicting, sub_conflicts))
+      end
+    end
+
+    -- Await staged submodule results
+    if sub_staged_waitable then
+      local sub_err, sub_files = await(sub_staged_waitable)
+      if sub_err then
+        errors[#errors+1] = sub_err
+        utils.err("Failed to get git status for staged submodule files!", true)
+      else
+        files:set_staged(utils.vec_join(files.staged, sub_files))
       end
     end
   end

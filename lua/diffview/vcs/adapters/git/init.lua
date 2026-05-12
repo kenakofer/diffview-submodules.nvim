@@ -1779,56 +1779,100 @@ local function submodule_path_args(submodule_path, path_args)
   return ret
 end
 
+---Check which submodules have dirty worktrees by running per-submodule
+---`git diff --quiet` jobs in parallel.  This replaces a single
+---`git status --ignore-submodules=none` call that was O(n_submodules)
+---and blocked for several seconds on large repos.
+---
 ---@param path_args string[]?
 ---@return string[]
-function GitAdapter:dirty_submodule_paths(path_args)
+GitAdapter.dirty_submodule_paths = async.wrap(function(self, path_args, callback)
+  -- Short TTL cache: avoids re-scanning within the same update cycle.
+  local cache_key = path_args and table.concat(path_args, "\0") or ""
+  local now = uv.hrtime()
+  if self._dirty_sub_cache
+    and self._dirty_sub_cache.key == cache_key
+    and (now - self._dirty_sub_cache.time) < 2e9
+  then
+    callback(self._dirty_sub_cache.result)
+    return
+  end
+
   local submodule_paths = self:submodule_paths()
   if #submodule_paths == 0 then
-    return {}
+    self._dirty_sub_cache = { result = {}, key = cache_key, time = now }
+    callback({})
+    return
   end
 
-  local submodule_map = {}
-  for _, path in ipairs(submodule_paths) do
-    submodule_map[path] = true
-  end
-
-  local out, code = self:exec_sync(
-    utils.vec_join(
-      "-c",
-      "core.quotePath=false",
-      "status",
-      "--porcelain=v1",
-      "--ignore-submodules=none",
-      "--",
-      path_args
-    ),
-    { cwd = self.ctx.toplevel, silent = true }
-  )
-
-  if code ~= 0 then
-    return {}
-  end
-
-  local dirty = {}
-
-  for _, line in ipairs(out) do
-    local path = line:sub(4):gsub("^.* %-> ", "")
-    path = pl:convert(path)
-
-    if submodule_map[path] then
-      dirty[path] = true
+  -- Filter candidates by path_args
+  local candidates = {}
+  for _, sub_path in ipairs(submodule_paths) do
+    local local_args = submodule_path_args(sub_path, path_args)
+    if local_args then
+      local abs = pl:join(self.ctx.toplevel, sub_path)
+      if pl:readable(abs) then
+        candidates[#candidates + 1] = sub_path
+      end
     end
   end
+
+  if #candidates == 0 then
+    self._dirty_sub_cache = { result = {}, key = cache_key, time = now }
+    callback({})
+    return
+  end
+
+  -- Spawn parallel `git diff --quiet` jobs — exit code 1 means dirty.
+  local jobs = {}
+  for i, sub_path in ipairs(candidates) do
+    jobs[i] = Job({
+      command = self:bin(),
+      args = utils.vec_join(self:args(), "diff", "--quiet"),
+      cwd = pl:join(self.ctx.toplevel, sub_path),
+      log_opt = { silent = true },
+    })
+  end
+
+  await(Job.join(jobs))
 
   local ret = {}
-  for _, path in ipairs(submodule_paths) do
-    if dirty[path] then
-      ret[#ret + 1] = path
+  for i, sub_path in ipairs(candidates) do
+    if jobs[i].code ~= 0 then
+      ret[#ret + 1] = sub_path
     end
   end
 
-  return ret
-end
+  -- Also check for staged-only changes (index differs from HEAD)
+  if #ret < #candidates then
+    local staged_jobs = {}
+    local staged_paths = {}
+    for i, sub_path in ipairs(candidates) do
+      if jobs[i].code == 0 then
+        local idx = #staged_jobs + 1
+        staged_paths[idx] = sub_path
+        staged_jobs[idx] = Job({
+          command = self:bin(),
+          args = utils.vec_join(self:args(), "diff", "--cached", "--quiet"),
+          cwd = pl:join(self.ctx.toplevel, sub_path),
+          log_opt = { silent = true },
+        })
+      end
+    end
+
+    if #staged_jobs > 0 then
+      await(Job.join(staged_jobs))
+      for i, sub_path in ipairs(staged_paths) do
+        if staged_jobs[i].code ~= 0 then
+          ret[#ret + 1] = sub_path
+        end
+      end
+    end
+  end
+
+  self._dirty_sub_cache = { result = ret, key = cache_key, time = now }
+  callback(ret)
+end)
 
 ---@param parent_rev Rev
 ---@param submodule_path string
@@ -1868,11 +1912,10 @@ GitAdapter.submodule_files = async.wrap(function(self, left, right, path_args, k
     return
   end
 
-  local files = {}
-  local conflicts = {}
-  local errors = {}
+  -- Prepare tasks for each dirty submodule so we can run them concurrently.
+  local tasks = {}
 
-  for _, submodule_path in ipairs(self:dirty_submodule_paths(path_args)) do
+  for _, submodule_path in ipairs(await(self:dirty_submodule_paths(path_args))) do
     local local_path_args = submodule_path_args(submodule_path, path_args)
 
     if local_path_args then
@@ -1890,33 +1933,62 @@ GitAdapter.submodule_files = async.wrap(function(self, left, right, path_args, k
             display_path_prefix = submodule_path,
           })
           local sub_rev_args = sub_adapter:rev_to_args(sub_left, sub_right)
-          local sub_err, sub_files, sub_conflicts = await(
-            sub_adapter:tracked_files(
-              sub_left,
-              sub_right,
-              utils.vec_join(sub_rev_args, "--", local_path_args),
-              kind,
-              sub_opt
-            )
-          )
+          local args = utils.vec_join(sub_rev_args, "--", local_path_args)
 
-          if sub_err then
-            errors[#errors + 1] = sub_err
-          else
-            files = utils.vec_join(files, sub_files)
-            conflicts = utils.vec_join(conflicts, sub_conflicts)
+          local idx = #tasks + 1
+          tasks[idx] = function()
+            return sub_adapter:tracked_files(sub_left, sub_right, args, kind, sub_opt)
           end
         end
       end
     end
   end
 
-  if #errors > 0 then
-    callback(utils.vec_join(unpack(errors)), nil, nil)
+  -- Single submodule: await directly (skip join overhead)
+  if #tasks == 1 then
+    local sub_err, sub_files, sub_conflicts = await(tasks[1]())
+    if sub_err then
+      callback(sub_err, nil, nil)
+    else
+      callback(nil, sub_files or {}, sub_conflicts or {})
+    end
     return
   end
 
-  callback(nil, files, conflicts)
+  -- Multiple submodules: launch concurrently and collect results
+  if #tasks > 0 then
+    local waitables = {}
+    for i, task_fn in ipairs(tasks) do
+      -- Start each tracked_files call; the returned waitable resolves later
+      local w = task_fn()
+      waitables[i] = w
+    end
+
+    -- Await all concurrently-started tasks
+    local files = {}
+    local conflicts = {}
+    local errors = {}
+
+    for i, w in ipairs(waitables) do
+      local sub_err, sub_files, sub_conflicts = await(w)
+      if sub_err then
+        errors[#errors + 1] = sub_err
+      else
+        files = utils.vec_join(files, sub_files)
+        conflicts = utils.vec_join(conflicts, sub_conflicts)
+      end
+    end
+
+    if #errors > 0 then
+      callback(utils.vec_join(unpack(errors)), nil, nil)
+      return
+    end
+
+    callback(nil, files, conflicts)
+    return
+  end
+
+  callback(nil, {}, {})
 end)
 
 GitAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt, callback)
