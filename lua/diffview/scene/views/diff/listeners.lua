@@ -10,6 +10,71 @@ local vcs_utils = lazy.require("diffview.vcs.utils") ---@module "diffview.vcs.ut
 local api = vim.api
 local await = async.await
 
+---@param file FileEntry
+---@return string
+local function file_display_path(file)
+  return file.display_path or file.path
+end
+
+---@param item FileEntry|DirData
+---@return FileEntry[]
+local function item_files(item)
+  if type(item.collapsed) ~= "boolean" then
+    return { item }
+  end
+
+  local files = {}
+
+  item._node:deep_some(function(node)
+    if not node:has_children() then
+      files[#files + 1] = node.data
+    end
+  end)
+
+  return files
+end
+
+---@param files FileEntry[]
+---@return { adapter: VCSAdapter, paths: string[] }[]
+local function group_paths_by_adapter(files)
+  local groups = {}
+  local keys = {}
+
+  for _, file in ipairs(files) do
+    local key = file.adapter.ctx.toplevel
+
+    if not groups[key] then
+      groups[key] = {
+        adapter = file.adapter,
+        paths = {},
+      }
+      keys[#keys + 1] = key
+    end
+
+    local paths = groups[key].paths
+    paths[#paths + 1] = file.path
+  end
+
+  return vim.tbl_map(function(key)
+    return groups[key]
+  end, keys)
+end
+
+---@param files FileEntry[]
+---@param action "add_files"|"reset_files"
+---@return boolean
+local function apply_file_action(files, action)
+  for _, group in ipairs(group_paths_by_adapter(files)) do
+    local success = group.adapter[action](group.adapter, group.paths)
+
+    if not success then
+      return false
+    end
+  end
+
+  return true
+end
+
 ---@param view DiffView
 return function(view)
   return {
@@ -135,14 +200,17 @@ return function(view)
       local item = view:infer_cur_file(true)
       if item then
         local success
+        local files = item_files(item)
+
         if item.kind == "working" or item.kind == "conflicting" then
-          success = view.adapter:add_files({ item.path })
+          success = apply_file_action(files, "add_files")
         elseif item.kind == "staged" then
-          success = view.adapter:reset_files({ item.path })
+          success = apply_file_action(files, "reset_files")
         end
 
         if not success then
-          utils.err(("Failed to stage/unstage file: '%s'"):format(item.path))
+          local path = type(item.collapsed) == "boolean" and item.path or file_display_path(item)
+          utils.err(("Failed to stage/unstage file: '%s'"):format(path))
           return
         end
 
@@ -190,12 +258,10 @@ return function(view)
       end
     end,
     stage_all = function()
-      local args = vim.tbl_map(function(file)
-        return file.path
-      end, utils.vec_join(view.files.working, view.files.conflicting))
+      local files = utils.vec_join(view.files.working, view.files.conflicting)
 
-      if #args > 0 then
-        local success = view.adapter:add_files(args)
+      if #files > 0 then
+        local success = apply_file_action(files, "add_files")
 
         if not success then
           utils.err("Failed to stage files!")
@@ -216,6 +282,15 @@ return function(view)
         return
       end
 
+      local submodule_staged = vim.tbl_filter(function(file)
+        return file.adapter ~= view.adapter
+      end, view.files.staged)
+
+      if #submodule_staged > 0 and not apply_file_action(submodule_staged, "reset_files") then
+        utils.err("Failed to unstage submodule files!")
+        return
+      end
+
       view:update_files()
       view.emitter:emit(EventName.FILES_STAGED, view)
     end,
@@ -225,23 +300,24 @@ return function(view)
         return
       end
 
-      local commit
-
-      if view.left.type ~= RevType.STAGE then
-        commit = view.left.commit
-      end
-
       local file = view:infer_cur_file()
       if not file then return end
 
-      local bufid = utils.find_file_buffer(file.path)
+      local commit
+      if file.revs and file.revs.a and file.revs.a.type == RevType.COMMIT then
+        commit = file.revs.a.commit
+      elseif view.left.type ~= RevType.STAGE then
+        commit = view.left.commit
+      end
+
+      local bufid = utils.find_file_buffer(file.absolute_path)
 
       if bufid and vim.bo[bufid].modified then
         utils.err("The file is open with unsaved changes! Aborting file restoration.")
         return
       end
 
-      await(vcs_utils.restore_file(view.adapter, file.path, file.kind, commit))
+      await(vcs_utils.restore_file(file.adapter, file.path, file.kind, commit))
       view:update_files()
     end),
     listing_style = function()
