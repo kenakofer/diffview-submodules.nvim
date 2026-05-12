@@ -26,6 +26,7 @@ local HAS_NVIM_0_10 = vim.fn.has("nvim-0.10") == 1
 ---@class vcs.File : diffview.Object
 ---@field adapter GitAdapter
 ---@field path string
+---@field display_path string
 ---@field absolute_path string
 ---@field parent_path string
 ---@field basename string
@@ -66,10 +67,11 @@ File.bufopts = {
 function File:init(opt)
   self.adapter = opt.adapter
   self.path = opt.path
+  self.display_path = opt.display_path or opt.path
   self.absolute_path = pl:absolute(opt.path, opt.adapter.ctx.toplevel)
-  self.parent_path = pl:parent(opt.path) or ""
-  self.basename = pl:basename(opt.path)
-  self.extension = pl:extension(opt.path)
+  self.parent_path = pl:parent(self.display_path) or ""
+  self.basename = pl:basename(self.display_path)
+  self.extension = pl:extension(self.display_path)
   self.kind = opt.kind
   self.binary = utils.sate(opt.binary)
   self.nulled = not not opt.nulled
@@ -119,8 +121,8 @@ function File:init(opt)
 
     if winbar then
       self.winbar = utils.str_template(winbar, {
-        path = self.path,
-        object_path = self.rev:object_name(10) .. ":" .. self.path,
+        path = self.display_path,
+        object_path = self.rev:object_name(10) .. ":" .. self.display_path,
         label = label or "",
       })
     end

@@ -293,7 +293,7 @@ end)
 DiffView.set_file_by_path = async.void(function(self, path, focus, highlight)
   ---@type FileEntry
   for _, file in self.files:iter() do
-    if file.path == path then
+    if file.path == path or file.display_path == path then
       await(self:set_file(file, focus, highlight))
       return
     end
@@ -384,7 +384,10 @@ DiffView.update_files = debounce.debounce_trailing(
       ---@param aa FileEntry
       ---@param bb FileEntry
       local diff = Diff(v.cur_files, v.new_files, function(aa, bb)
-        return aa.path == bb.path and aa.oldpath == bb.oldpath
+        return aa.adapter.ctx.toplevel == bb.adapter.ctx.toplevel
+          and aa.path == bb.path
+          and aa.oldpath == bb.oldpath
+          and aa.display_path == bb.display_path
       end)
 
       local script = diff:create_edit_script()
@@ -404,7 +407,9 @@ DiffView.update_files = debounce.debounce_trailing(
           end
 
           v.cur_files[ai].status = v.new_files[bi].status
-          v.cur_files[ai]:validate_stage_buffers(index_stat)
+          v.cur_files[ai]:validate_stage_buffers(
+            v.cur_files[ai].adapter == self.adapter and index_stat or nil
+          )
 
           if new_head then
             v.cur_files[ai]:update_heads(new_head)
@@ -474,7 +479,7 @@ DiffView.update_files = debounce.debounce_trailing(
     -- Set initially selected file
     if not self.initialized and self.options.selected_file then
       for _, file in self.files:iter() do
-        if file.path == self.options.selected_file then
+        if file.path == self.options.selected_file or file.display_path == self.options.selected_file then
           self.panel:set_cur_file(file)
           break
         end

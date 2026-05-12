@@ -29,6 +29,8 @@ local fstat_cache = {}
 ---@field adapter GitAdapter
 ---@field path string
 ---@field oldpath string
+---@field display_path string
+---@field old_display_path string
 ---@field absolute_path string
 ---@field parent_path string
 ---@field basename string
@@ -48,6 +50,8 @@ local FileEntry = oop.create_class("FileEntry")
 ---@field adapter GitAdapter
 ---@field path string
 ---@field oldpath string
+---@field display_path? string
+---@field old_display_path? string
 ---@field revs RevMap
 ---@field layout Layout
 ---@field status string
@@ -62,10 +66,12 @@ function FileEntry:init(opt)
   self.adapter = opt.adapter
   self.path = opt.path
   self.oldpath = opt.oldpath
+  self.display_path = opt.display_path or opt.path
+  self.old_display_path = opt.old_display_path or opt.oldpath
   self.absolute_path = pl:absolute(opt.path, opt.adapter.ctx.toplevel)
-  self.parent_path = pl:parent(opt.path) or ""
-  self.basename = pl:basename(opt.path)
-  self.extension = pl:extension(opt.path)
+  self.parent_path = pl:parent(self.display_path) or ""
+  self.basename = pl:basename(self.display_path)
+  self.extension = pl:extension(self.display_path)
   self.revs = opt.revs
   self.layout = opt.layout
   self.status = opt.status
@@ -119,6 +125,7 @@ function FileEntry:convert_layout(target_layout)
     return File({
       adapter = self.adapter,
       path = symbol == "a" and self.oldpath or self.path,
+      display_path = symbol == "a" and self.old_display_path or self.display_path,
       kind = self.kind,
       commit = self.commit,
       get_data = get_data,
@@ -304,6 +311,8 @@ end
 ---@class FileEntry.with_layout.Opt : FileEntry.init.Opt
 ---@field nulled boolean
 ---@field get_data git.FileDataProducer?
+---@field display_path? string
+---@field old_display_path? string
 
 ---@param layout_class Layout (class)
 ---@param opt FileEntry.with_layout.Opt
@@ -313,6 +322,7 @@ function FileEntry.with_layout(layout_class, opt)
     return File({
       adapter = opt.adapter,
       path = symbol == "a" and opt.oldpath or opt.path,
+      display_path = symbol == "a" and opt.old_display_path or opt.display_path,
       kind = opt.kind,
       commit = opt.commit,
       get_data = opt.get_data,
@@ -328,6 +338,8 @@ function FileEntry.with_layout(layout_class, opt)
     adapter = opt.adapter,
     path = opt.path,
     oldpath = opt.oldpath,
+    display_path = opt.display_path,
+    old_display_path = opt.old_display_path,
     status = opt.status,
     stats = opt.stats,
     kind = opt.kind,

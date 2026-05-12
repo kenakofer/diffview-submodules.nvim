@@ -1693,6 +1693,232 @@ function GitAdapter:show_untracked(opt)
   return vim.trim(out[1] or "") ~= "no"
 end
 
+---@return string[]
+function GitAdapter:submodule_paths()
+  if self._submodule_paths then
+    return self._submodule_paths
+  end
+
+  local paths = {}
+  local out, code = self:exec_sync(
+    { "config", "--file", ".gitmodules", "--get-regexp", "path" },
+    { cwd = self.ctx.toplevel, silent = true }
+  )
+
+  if code == 0 then
+    for _, line in ipairs(out) do
+      local path = line:match("%s(.+)$")
+      if path then
+        paths[#paths + 1] = pl:convert(path)
+      end
+    end
+  end
+
+  self._submodule_paths = paths
+  return paths
+end
+
+---@param submodule_path string
+---@return string? err
+---@return GitAdapter? adapter
+function GitAdapter:submodule_adapter(submodule_path)
+  self._submodule_adapters = self._submodule_adapters or {}
+
+  if self._submodule_adapters[submodule_path] then
+    return nil, self._submodule_adapters[submodule_path]
+  end
+
+  local toplevel = pl:join(self.ctx.toplevel, submodule_path)
+  local err, adapter = GitAdapter.create(toplevel, {}, toplevel)
+
+  if err then
+    return err
+  end
+
+  self._submodule_adapters[submodule_path] = adapter
+  return nil, adapter
+end
+
+---@param path string
+---@param base string
+---@return boolean
+local function path_is_at_or_under(path, base)
+  return path == base or vim.startswith(path, pl:add_trailing(base))
+end
+
+---@param submodule_path string
+---@param path_args string[]?
+---@return string[]? path_args
+local function submodule_path_args(submodule_path, path_args)
+  if not path_args or #path_args == 0 then
+    return {}
+  end
+
+  local ret = {}
+
+  for _, path_arg in ipairs(path_args) do
+    local magic, pattern = GitAdapter.pathspec_split(path_arg)
+
+    if magic ~= "" then
+      return {}
+    end
+
+    pattern = pl:convert(pattern)
+
+    if pattern == "." or pattern == "" or path_is_at_or_under(submodule_path, pattern) then
+      return {}
+    elseif path_is_at_or_under(pattern, submodule_path) then
+      ret[#ret + 1] = pl:relative(pattern, submodule_path, true)
+    end
+  end
+
+  if #ret == 0 then
+    return nil
+  end
+
+  return ret
+end
+
+---@param path_args string[]?
+---@return string[]
+function GitAdapter:dirty_submodule_paths(path_args)
+  local submodule_paths = self:submodule_paths()
+  if #submodule_paths == 0 then
+    return {}
+  end
+
+  local submodule_map = {}
+  for _, path in ipairs(submodule_paths) do
+    submodule_map[path] = true
+  end
+
+  local out, code = self:exec_sync(
+    utils.vec_join(
+      "-c",
+      "core.quotePath=false",
+      "status",
+      "--porcelain=v1",
+      "--ignore-submodules=none",
+      "--",
+      path_args
+    ),
+    { cwd = self.ctx.toplevel, silent = true }
+  )
+
+  if code ~= 0 then
+    return {}
+  end
+
+  local dirty = {}
+
+  for _, line in ipairs(out) do
+    local path = line:sub(4):gsub("^.* %-> ", "")
+    path = pl:convert(path)
+
+    if submodule_map[path] then
+      dirty[path] = true
+    end
+  end
+
+  local ret = {}
+  for _, path in ipairs(submodule_paths) do
+    if dirty[path] then
+      ret[#ret + 1] = path
+    end
+  end
+
+  return ret
+end
+
+---@param parent_rev Rev
+---@param submodule_path string
+---@return Rev?
+function GitAdapter:submodule_rev(parent_rev, submodule_path)
+  if parent_rev.type == RevType.LOCAL then
+    return GitRev(RevType.LOCAL)
+  elseif parent_rev.type == RevType.STAGE then
+    return GitRev(RevType.STAGE, parent_rev.stage)
+  elseif parent_rev.type == RevType.COMMIT then
+    local out, code = self:exec_sync(
+      { "rev-parse", fmt("%s:%s", parent_rev.commit, submodule_path) },
+      { cwd = self.ctx.toplevel, silent = true, fail_on_empty = true }
+    )
+
+    if code == 0 and out[1] then
+      local commit = vim.trim(out[1]):gsub("^%^", "")
+      return GitRev(RevType.COMMIT, commit)
+    end
+  end
+end
+
+---@param self GitAdapter
+---@param left Rev
+---@param right Rev
+---@param path_args string[]?
+---@param kind vcs.FileKind
+---@param opt vcs.adapter.LayoutOpt
+---@param callback function
+GitAdapter.submodule_files = async.wrap(function(self, left, right, path_args, kind, opt, callback)
+  if not (
+        kind == "working" and right.type == RevType.LOCAL
+        or kind == "staged" and right.type == RevType.STAGE
+      )
+  then
+    callback(nil, {}, {})
+    return
+  end
+
+  local files = {}
+  local conflicts = {}
+  local errors = {}
+
+  for _, submodule_path in ipairs(self:dirty_submodule_paths(path_args)) do
+    local local_path_args = submodule_path_args(submodule_path, path_args)
+
+    if local_path_args then
+      local err, sub_adapter = self:submodule_adapter(submodule_path)
+
+      if err then
+        logger:fmt_warn("Skipping submodule '%s': %s", submodule_path, err)
+      else
+        ---@cast sub_adapter GitAdapter
+        local sub_left = self:submodule_rev(left, submodule_path)
+        local sub_right = self:submodule_rev(right, submodule_path)
+
+        if sub_left and sub_right then
+          local sub_opt = vim.tbl_extend("force", opt, {
+            display_path_prefix = submodule_path,
+          })
+          local sub_rev_args = sub_adapter:rev_to_args(sub_left, sub_right)
+          local sub_err, sub_files, sub_conflicts = await(
+            sub_adapter:tracked_files(
+              sub_left,
+              sub_right,
+              utils.vec_join(sub_rev_args, "--", local_path_args),
+              kind,
+              sub_opt
+            )
+          )
+
+          if sub_err then
+            errors[#errors + 1] = sub_err
+          else
+            files = utils.vec_join(files, sub_files)
+            conflicts = utils.vec_join(conflicts, sub_conflicts)
+          end
+        end
+      end
+    end
+  end
+
+  if #errors > 0 then
+    callback(utils.vec_join(unpack(errors)), nil, nil)
+    return
+  end
+
+  callback(nil, files, conflicts)
+end)
+
 GitAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt, callback)
   ---@type FileEntry[]
   local files = {}
@@ -1799,6 +2025,11 @@ GitAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, op
         adapter = self,
         path = v.name,
         oldpath = v.oldname,
+        display_path = opt.display_path_prefix and pl:join(opt.display_path_prefix, v.name) or nil,
+        old_display_path = opt.display_path_prefix
+          and v.oldname
+          and pl:join(opt.display_path_prefix, v.oldname)
+          or nil,
         status = "U",
         kind = "conflicting",
         revs = {
@@ -1816,6 +2047,11 @@ GitAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, op
       adapter = self,
       path = v.name,
       oldpath = v.oldname,
+      display_path = opt.display_path_prefix and pl:join(opt.display_path_prefix, v.name) or nil,
+      old_display_path = opt.display_path_prefix
+        and v.oldname
+        and pl:join(opt.display_path_prefix, v.oldname)
+        or nil,
       status = v.status,
       stats = v.stats,
       kind = kind,
@@ -1866,6 +2102,7 @@ GitAdapter.untracked_files = async.wrap(function(self, left, right, opt, callbac
     table.insert(files, FileEntry.with_layout(opt.default_layout, {
       adapter = self,
       path = s,
+      display_path = opt.display_path_prefix and pl:join(opt.display_path_prefix, s) or nil,
       status = "?",
       kind = "working",
       revs = {

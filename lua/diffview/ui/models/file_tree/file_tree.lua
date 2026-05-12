@@ -31,7 +31,7 @@ end
 
 ---@param file FileEntry
 function FileTree:add_file_entry(file)
-  local parts = pl:explode(file.path)
+  local parts = pl:explode(file.display_path or file.path)
   local cur_node = self.root
 
   local path = parts[1]

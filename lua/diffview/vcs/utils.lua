@@ -92,6 +92,20 @@ M.diff_file_list = async.wrap(function(adapter, left, right, path_args, dv_opt, 
     files:set_working(tfiles)
     files:set_conflicting(tconflicts)
 
+    if adapter.submodule_files then
+      local sub_err, sub_files, sub_conflicts = await(
+        adapter:submodule_files(left, right, path_args, "working", opt)
+      )
+
+      if sub_err then
+        errors[#errors+1] = sub_err
+        utils.err("Failed to get git status for submodule files!", true)
+      else
+        files:set_working(utils.vec_join(files.working, sub_files))
+        files:set_conflicting(utils.vec_join(files.conflicting, sub_conflicts))
+      end
+    end
+
     if not adapter:show_untracked({
         dv_opt = dv_opt,
         revs = { left = left, right = right },
@@ -132,6 +146,19 @@ M.diff_file_list = async.wrap(function(adapter, left, right, path_args, dv_opt, 
       utils.err("Failed to get git status for staged files!", true)
     else
       files:set_staged(tfiles)
+
+      if adapter.submodule_files then
+        local sub_err, sub_files = await(
+          adapter:submodule_files(left_rev, right_rev, path_args, "staged", opt)
+        )
+
+        if sub_err then
+          errors[#errors+1] = sub_err
+          utils.err("Failed to get git status for staged submodule files!", true)
+        else
+          files:set_staged(utils.vec_join(files.staged, sub_files))
+        end
+      end
     end
   end
 
