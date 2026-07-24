@@ -1874,6 +1874,64 @@ GitAdapter.dirty_submodule_paths = async.wrap(function(self, path_args, callback
   callback(ret)
 end)
 
+---Find submodules whose currently checked out commit differs from the
+---gitlink recorded in `left`, even though the submodule's own worktree may
+---be perfectly clean. This covers the common case of comparing two
+---historical commits (or a historical commit against the current worktree),
+---where the submodule pointer was bumped but nothing is locally dirty inside
+---the submodule itself. `dirty_submodule_paths` alone cannot detect this,
+---since it only looks at uncommitted changes relative to the submodule's own
+---HEAD.
+---@param left Rev
+---@param exclude table<string, boolean> Paths to skip (e.g. already known dirty)
+---@param path_args string[]?
+---@return string[]
+GitAdapter.repinned_submodule_paths = async.wrap(function(self, left, exclude, path_args, callback)
+  if left.type ~= RevType.COMMIT then
+    callback({})
+    return
+  end
+
+  local candidates = {}
+  for _, sub_path in ipairs(self:submodule_paths()) do
+    if not exclude[sub_path] and submodule_path_args(sub_path, path_args) then
+      local abs = pl:join(self.ctx.toplevel, sub_path)
+      if pl:readable(abs) then
+        candidates[#candidates + 1] = sub_path
+      end
+    end
+  end
+
+  if #candidates == 0 then
+    callback({})
+    return
+  end
+
+  local jobs = {}
+  for i, sub_path in ipairs(candidates) do
+    jobs[i] = Job({
+      command = self:bin(),
+      args = { "rev-parse", "HEAD" },
+      cwd = pl:join(self.ctx.toplevel, sub_path),
+      log_opt = { silent = true },
+    })
+  end
+
+  await(Job.join(jobs))
+
+  local ret = {}
+  for i, sub_path in ipairs(candidates) do
+    local left_rev = self:submodule_rev(left, sub_path)
+    local head = vim.trim(table.concat(jobs[i].stdout or {}, ""))
+
+    if left_rev and head ~= "" and head ~= left_rev.commit then
+      ret[#ret + 1] = sub_path
+    end
+  end
+
+  callback(ret)
+end)
+
 ---@param parent_rev Rev
 ---@param submodule_path string
 ---@return Rev?
@@ -1912,10 +1970,24 @@ GitAdapter.submodule_files = async.wrap(function(self, left, right, path_args, k
     return
   end
 
-  -- Prepare tasks for each dirty submodule so we can run them concurrently.
+  -- Prepare tasks for each dirty/repinned submodule so we can run them concurrently.
   local tasks = {}
 
-  for _, submodule_path in ipairs(await(self:dirty_submodule_paths(path_args))) do
+  local dirty_paths = await(self:dirty_submodule_paths(path_args))
+  local dirty_set = {}
+  for _, sub_path in ipairs(dirty_paths) do
+    dirty_set[sub_path] = true
+  end
+
+  -- Only relevant for "working" comparisons: submodules whose pinned commit
+  -- moved between `left` and the current checkout, but whose worktree is
+  -- otherwise clean, are missed by the dirty check above.
+  local repinned_paths = {}
+  if kind == "working" then
+    repinned_paths = await(self:repinned_submodule_paths(left, dirty_set, path_args))
+  end
+
+  for _, submodule_path in ipairs(utils.vec_join(dirty_paths, repinned_paths)) do
     local local_path_args = submodule_path_args(submodule_path, path_args)
 
     if local_path_args then
