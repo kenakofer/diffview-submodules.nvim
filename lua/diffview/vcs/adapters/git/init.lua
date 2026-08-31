@@ -1780,7 +1780,7 @@ local function submodule_path_args(submodule_path, path_args)
 end
 
 ---Check which submodules have dirty worktrees by running per-submodule
----`git diff --quiet` jobs in parallel.  This replaces a single
+---`git diff --quiet HEAD` jobs in parallel. This replaces a single
 ---`git status --ignore-submodules=none` call that was O(n_submodules)
 ---and blocked for several seconds on large repos.
 ---
@@ -1823,12 +1823,13 @@ GitAdapter.dirty_submodule_paths = async.wrap(function(self, path_args, callback
     return
   end
 
-  -- Spawn parallel `git diff --quiet` jobs — exit code 1 means dirty.
+  -- Comparing HEAD to the worktree detects staged and unstaged changes in
+  -- one process while still letting Git refresh stale index stat data.
   local jobs = {}
   for i, sub_path in ipairs(candidates) do
     jobs[i] = Job({
       command = self:bin(),
-      args = utils.vec_join(self:args(), "diff", "--quiet"),
+      args = utils.vec_join(self:args(), "diff", "--quiet", "HEAD", "--"),
       cwd = pl:join(self.ctx.toplevel, sub_path),
       log_opt = { silent = true },
     })
@@ -1840,33 +1841,6 @@ GitAdapter.dirty_submodule_paths = async.wrap(function(self, path_args, callback
   for i, sub_path in ipairs(candidates) do
     if jobs[i].code ~= 0 then
       ret[#ret + 1] = sub_path
-    end
-  end
-
-  -- Also check for staged-only changes (index differs from HEAD)
-  if #ret < #candidates then
-    local staged_jobs = {}
-    local staged_paths = {}
-    for i, sub_path in ipairs(candidates) do
-      if jobs[i].code == 0 then
-        local idx = #staged_jobs + 1
-        staged_paths[idx] = sub_path
-        staged_jobs[idx] = Job({
-          command = self:bin(),
-          args = utils.vec_join(self:args(), "diff", "--cached", "--quiet"),
-          cwd = pl:join(self.ctx.toplevel, sub_path),
-          log_opt = { silent = true },
-        })
-      end
-    end
-
-    if #staged_jobs > 0 then
-      await(Job.join(staged_jobs))
-      for i, sub_path in ipairs(staged_paths) do
-        if staged_jobs[i].code ~= 0 then
-          ret[#ret + 1] = sub_path
-        end
-      end
     end
   end
 
@@ -1883,21 +1857,22 @@ end)
 ---since it only looks at uncommitted changes relative to the submodule's own
 ---HEAD.
 ---@param left Rev
----@param exclude table<string, boolean> Paths to skip (e.g. already known dirty)
 ---@param path_args string[]?
 ---@return string[]
-GitAdapter.repinned_submodule_paths = async.wrap(function(self, left, exclude, path_args, callback)
+GitAdapter.repinned_submodule_paths = async.wrap(function(self, left, path_args, callback)
   if left.type ~= RevType.COMMIT then
     callback({})
     return
   end
 
   local candidates = {}
+  local candidate_map = {}
   for _, sub_path in ipairs(self:submodule_paths()) do
-    if not exclude[sub_path] and submodule_path_args(sub_path, path_args) then
+    if submodule_path_args(sub_path, path_args) then
       local abs = pl:join(self.ctx.toplevel, sub_path)
       if pl:readable(abs) then
         candidates[#candidates + 1] = sub_path
+        candidate_map[sub_path] = true
       end
     end
   end
@@ -1907,12 +1882,40 @@ GitAdapter.repinned_submodule_paths = async.wrap(function(self, left, exclude, p
     return
   end
 
+  -- Keep each argv well below Windows' command-line length limit.
+  local path_batches = { {} }
+  local batch_len = 0
+  for _, sub_path in ipairs(candidates) do
+    local pathspec = ":(top,literal)" .. pl:convert(sub_path, "/")
+    if batch_len > 0 and batch_len + #pathspec + 1 > 8192 then
+      path_batches[#path_batches + 1] = {}
+      batch_len = 0
+    end
+    local batch = path_batches[#path_batches]
+    batch[#batch + 1] = pathspec
+    batch_len = batch_len + #pathspec + 1
+  end
+
+  -- Git can compare checked-out gitlinks against the left tree in batched
+  -- superproject processes. Ignoring "dirty" still reports new commits while
+  -- excluding ordinary worktree changes inside the submodules.
   local jobs = {}
-  for i, sub_path in ipairs(candidates) do
+  for i, paths in ipairs(path_batches) do
     jobs[i] = Job({
       command = self:bin(),
-      args = { "rev-parse", "HEAD" },
-      cwd = pl:join(self.ctx.toplevel, sub_path),
+      args = utils.vec_join(
+        self:args(),
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--name-only",
+        "--diff-filter=M",
+        "--ignore-submodules=dirty",
+        left.commit,
+        "--",
+        paths
+      ),
+      cwd = self.ctx.toplevel,
       log_opt = { silent = true },
     })
   end
@@ -1920,12 +1923,18 @@ GitAdapter.repinned_submodule_paths = async.wrap(function(self, left, exclude, p
   await(Job.join(jobs))
 
   local ret = {}
-  for i, sub_path in ipairs(candidates) do
-    local left_rev = self:submodule_rev(left, sub_path)
-    local head = vim.trim(table.concat(jobs[i].stdout or {}, ""))
+  for _, job in ipairs(jobs) do
+    if job.code ~= 0 then
+      logger:fmt_warn("Failed to detect repinned submodules: %s", table.concat(job.stderr, "\n"))
+      callback({})
+      return
+    end
 
-    if left_rev and head ~= "" and head ~= left_rev.commit then
-      ret[#ret + 1] = sub_path
+    for _, path in ipairs(job.stdout) do
+      path = pl:convert(path)
+      if candidate_map[path] then
+        ret[#ret + 1] = path
+      end
     end
   end
 
@@ -1973,7 +1982,13 @@ GitAdapter.submodule_files = async.wrap(function(self, left, right, path_args, k
   -- Prepare tasks for each dirty/repinned submodule so we can run them concurrently.
   local tasks = {}
 
-  local dirty_paths = await(self:dirty_submodule_paths(path_args))
+  local dirty_waitable = self:dirty_submodule_paths(path_args)
+  local repinned_waitable
+  if kind == "working" then
+    repinned_waitable = self:repinned_submodule_paths(left, path_args)
+  end
+
+  local dirty_paths = await(dirty_waitable)
   local dirty_set = {}
   for _, sub_path in ipairs(dirty_paths) do
     dirty_set[sub_path] = true
@@ -1983,8 +1998,12 @@ GitAdapter.submodule_files = async.wrap(function(self, left, right, path_args, k
   -- moved between `left` and the current checkout, but whose worktree is
   -- otherwise clean, are missed by the dirty check above.
   local repinned_paths = {}
-  if kind == "working" then
-    repinned_paths = await(self:repinned_submodule_paths(left, dirty_set, path_args))
+  if repinned_waitable then
+    for _, sub_path in ipairs(await(repinned_waitable)) do
+      if not dirty_set[sub_path] then
+        repinned_paths[#repinned_paths + 1] = sub_path
+      end
+    end
   end
 
   for _, submodule_path in ipairs(utils.vec_join(dirty_paths, repinned_paths)) do
