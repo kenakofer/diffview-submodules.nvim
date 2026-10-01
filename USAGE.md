@@ -11,7 +11,8 @@ Submodules appear as read-only `Subproject commit <sha>` diffs in the parent
 repository. Local changes add a `-dirty` suffix. Press `gs` on a submodule in
 the file panel, history panel, or diff buffer to open its file changes in a
 new Diffview tab without changing the parent view or the global working
-directory.
+directory. The SHA buffers also display a reminder to press `gs` to open the
+submodule diff in a new tab.
 
 The new tab compares the referenced commits for staged or historical changes,
 or the left reference against the submodule's working tree for local changes.

@@ -130,7 +130,11 @@ describe("submodule reference diffs", function()
     }) do
       local file = File({ adapter = adapter, path = "module with spaces", kind = "working", rev = item.rev })
       local bufnr = await(file:create_buffer())
-      eq({ item.line }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+      eq({
+        item.line,
+        "",
+        "Press gs to open the submodule diff in a new tab.",
+      }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
       eq(false, vim.bo[bufnr].modifiable)
       eq("nowrite", vim.bo[bufnr].buftype)
       file:destroy()
@@ -234,7 +238,11 @@ describe("submodule reference diffs", function()
   it("refreshes the local SHA after the submodule checkout changes", function()
     local view = open({ "-C" .. parent })
     local file = view.cur_entry.layout.b.file
-    eq({ "Subproject commit " .. latest }, vim.api.nvim_buf_get_lines(file.bufnr, 0, -1, false))
+    eq({
+      "Subproject commit " .. latest,
+      "",
+      "Press gs to open the submodule diff in a new tab.",
+    }, vim.api.nvim_buf_get_lines(file.bufnr, 0, -1, false))
     git(module, "checkout", "--quiet", old)
     local finished = false
     view:update_files(function(err)
@@ -242,7 +250,11 @@ describe("submodule reference diffs", function()
       finished = true
     end)
     assert(vim.wait(10000, function() return finished and file:is_valid() end, 10))
-    eq({ "Subproject commit " .. old }, vim.api.nvim_buf_get_lines(file.bufnr, 0, -1, false))
+    eq({
+      "Subproject commit " .. old,
+      "",
+      "Press gs to open the submodule diff in a new tab.",
+    }, vim.api.nvim_buf_get_lines(file.bufnr, 0, -1, false))
     eq({}, errors)
   end)
 

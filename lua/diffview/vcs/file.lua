@@ -182,7 +182,11 @@ end
 ---@param callback (fun(err?: string[], data?: string[]))
 File.produce_data = async.wrap(function(self, callback)
   if self.submodule then
-    callback(nil, { "Subproject commit " .. self.submodule.sha .. (self.submodule.dirty and "-dirty" or "") })
+    callback(nil, {
+      "Subproject commit " .. self.submodule.sha .. (self.submodule.dirty and "-dirty" or ""),
+      "",
+      "Press gs to open the submodule diff in a new tab.",
+    })
   elseif self.get_data and vim.is_callable(self.get_data) then
     local pos = self.symbol == "a" and "left" or "right"
     local data = self.get_data(self.kind, self.path, pos)
