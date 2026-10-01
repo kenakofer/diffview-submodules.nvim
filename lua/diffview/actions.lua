@@ -7,6 +7,7 @@ local DiffView = lazy.access("diffview.scene.views.diff.diff_view", "DiffView") 
 local FileHistoryView = lazy.access("diffview.scene.views.file_history.file_history_view", "FileHistoryView") ---@type FileHistoryView|LazyModule
 local HelpPanel = lazy.access("diffview.ui.panels.help_panel", "HelpPanel") ---@type HelpPanel|LazyModule
 local StandardView = lazy.access("diffview.scene.views.standard.standard_view", "StandardView") ---@type StandardView|LazyModule
+local RevType = lazy.access("diffview.vcs.rev", "RevType") ---@type RevType|LazyModule
 local lib = lazy.require("diffview.lib") ---@module "diffview.lib"
 local utils = lazy.require("diffview.utils") ---@module "diffview.utils"
 local vcs_utils = lazy.require("diffview.vcs.utils") ---@module "diffview.vcs.utils"
@@ -162,6 +163,66 @@ function M.goto_file_tab()
       utils.set_cursor(0, unpack(cursor))
     end
   end
+end
+
+function M.open_submodule()
+  local view = lib.get_current_view()
+  if not view or not (
+    view:instanceof(DiffView.__get()) or view:instanceof(FileHistoryView.__get())
+  ) then
+    utils.err("Open a Diffview before opening a submodule.")
+    return
+  end
+
+  local file = view:infer_cur_file()
+  if not file or not file.adapter.get_gitlink then
+    utils.err("Select a Git submodule entry first.")
+    return
+  end
+  if file.status == "U" then
+    utils.err("Resolve the submodule's conflicting reference before opening its diff.")
+    return
+  end
+
+  local adapter = file.adapter
+  local left, err = adapter:get_gitlink(file.oldpath or file.path, file.revs.a)
+  if err then utils.err(err) return end
+  local right
+  right, err = adapter:get_gitlink(file.path, file.revs.b)
+  if err then utils.err(err) return end
+  if not left and not right then
+    utils.err("The selected entry is not a submodule.")
+    return
+  end
+
+  local cwd = file.absolute_path
+  if not pl:stat(pl:join(cwd, ".git")) and file.oldpath then
+    cwd = pl:absolute(file.oldpath, adapter.ctx.toplevel)
+  end
+  if not pl:stat(pl:join(cwd, ".git")) then
+    utils.err("Submodule is not initialized: " .. cwd .. ". Run git submodule update --init first.")
+    return
+  end
+
+  for _, link in ipairs({ left or false, right or false }) do
+    if link then
+      local _, code = adapter:exec_sync({ "cat-file", "-e", link.sha .. "^{commit}" }, {
+        cwd = cwd, silent = true,
+      })
+      if code ~= 0 then
+        utils.err("Submodule commit " .. link.sha .. " is unavailable in " .. cwd .. ". Fetch it first.")
+        return
+      end
+    end
+  end
+
+  local null_tree = adapter.Rev.NULL_TREE_SHA
+  local rev_arg = left and left.sha or null_tree
+  if file.revs.b.type ~= RevType.LOCAL or not right then
+    rev_arg = rev_arg .. ".." .. (right and right.sha or null_tree)
+  end
+  local subview = lib.diffview_open({ rev_arg, "-C" .. cwd })
+  if subview then subview:open() end
 end
 
 ---@class diffview.ConflictCount

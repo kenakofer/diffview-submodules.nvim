@@ -1040,6 +1040,25 @@ goto_file_tab                                   *diffview-actions-goto_file_tab*
         |diffview-file-inference| for details on how the file target is
         determined.
 
+open_submodule                                  *diffview-actions-open_submodule*
+        Contexts: `view`, `file_panel`, `file_history_panel`
+
+        Open the selected submodule's diff in a new Diffview tabpage (default:
+        `gs`). The parent view shows only read-only "Subproject commit <sha>"
+        lines, with "-dirty" for local modifications, rather than expanding
+        the submodule's files.
+
+        Committed and staged entries compare the two referenced commits.
+        Working-tree entries compare the left reference against the submodule's
+        working tree, including staged and unstaged changes. Added and deleted
+        references compare against an empty tree. Nested submodules can be
+        opened the same way.
+
+        The submodule must be initialized and both referenced commits must be
+        available locally; no initialization or fetching happens automatically.
+        Conflicting references must be resolved before opening a submodule diff.
+        Parent-view stage/unstage actions still operate on the gitlink.
+
 jumpto_conflict({num}, {use_delta})             *diffview-actions-jumpto_conflict*
         Contexts: `diff_view`, `file_panel`
 

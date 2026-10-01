@@ -44,6 +44,7 @@ local HAS_NVIM_0_10 = vim.fn.has("nvim-0.10") == 1
 ---@field winbar string?
 ---@field winopts WindowOptions
 ---@field custom_folds? CustomFolds
+---@field submodule? git.Gitlink
 local File = oop.create_class("vcs.File")
 
 ---@type table<integer, vcs.File.AttachState>
@@ -132,7 +133,7 @@ function File:destroy(force)
   self.active = false
   self:detach_buffer()
 
-  if force or self.rev.type ~= RevType.LOCAL and not lib.is_buf_in_use(self.bufnr, { self }) then
+  if force or (self.submodule or self.rev.type ~= RevType.LOCAL) and not lib.is_buf_in_use(self.bufnr, { self }) then
     File.safe_delete_buf(self.bufnr)
   end
 end
@@ -180,7 +181,9 @@ end
 ---@param self vcs.File
 ---@param callback (fun(err?: string[], data?: string[]))
 File.produce_data = async.wrap(function(self, callback)
-  if self.get_data and vim.is_callable(self.get_data) then
+  if self.submodule then
+    callback(nil, { "Subproject commit " .. self.submodule.sha .. (self.submodule.dirty and "-dirty" or "") })
+  elseif self.get_data and vim.is_callable(self.get_data) then
     local pos = self.symbol == "a" and "left" or "right"
     local data = self.get_data(self.kind, self.path, pos)
     callback(nil, data)
@@ -210,6 +213,18 @@ File.create_buffer = async.wrap(function(self, callback)
     return
   end
 
+  if not self.nulled and not self.get_data and self.adapter.get_gitlink then
+    local was_submodule = self.submodule
+    local err
+    self.submodule, err = self.adapter:get_gitlink(self.path, self.rev)
+    if err then error(table.concat(err, "\n")) end
+    if self.submodule then
+      self.binary = false
+    elseif was_submodule then
+      self.binary = nil
+    end
+  end
+
   if self.binary == nil and not config.get_config().diff_binaries then
     self.binary = self.adapter:is_binary(self.path, self.rev)
   end
@@ -221,7 +236,7 @@ File.create_buffer = async.wrap(function(self, callback)
     return
   end
 
-  if self.rev.type == RevType.LOCAL then
+  if self.rev.type == RevType.LOCAL and not self.submodule then
     self:_create_local_buffer()
     callback(self.bufnr)
     return
@@ -234,6 +249,11 @@ File.create_buffer = async.wrap(function(self, callback)
     context = fmt(":%d:", self.rev.stage)
   elseif self.rev.type == RevType.CUSTOM then
     context = "[custom]"
+  elseif self.rev.type == RevType.LOCAL then
+    context = "[working]"
+  end
+  if self.submodule then
+    context = context .. "/" .. self.submodule.sha .. (self.submodule.dirty and "-dirty" or "")
   end
 
   local fullname = pl:join("diffview://", self.adapter.ctx.dir, context, self.path)
@@ -263,7 +283,7 @@ File.create_buffer = async.wrap(function(self, callback)
   end
   local bufopts = vim.deepcopy(File.bufopts)
 
-  if self.rev.type == RevType.STAGE and self.rev.stage == 0 then
+  if self.rev.type == RevType.STAGE and self.rev.stage == 0 and not self.submodule then
     self.blob_hash = self.adapter:file_blob_hash(self.path)
     bufopts.modifiable = true
     bufopts.buftype = nil

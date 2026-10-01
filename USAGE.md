@@ -5,6 +5,25 @@ some more specific use-cases.
 
 ## Review a PR
 
+### Reviewing Submodules
+
+Submodules appear as read-only `Subproject commit <sha>` diffs in the parent
+repository. Local changes add a `-dirty` suffix. Press `gs` on a submodule in
+the file panel, history panel, or diff buffer to open its file changes in a
+new Diffview tab without changing the parent view or the global working
+directory.
+
+The new tab compares the referenced commits for staged or historical changes,
+or the left reference against the submodule's working tree for local changes.
+Added/deleted submodules compare against an empty tree; nested submodules use
+the same action. Initialize the submodule and fetch any missing referenced
+commits first. Resolve conflicting gitlink references before opening their diff.
+Stage/unstage in the parent still stages/unstages the reference, not individual
+submodule files. The SHA buffers cannot be edited or written to the index.
+
+To remap the action, use `require("diffview.actions").open_submodule` in the
+`view`, `file_panel`, and `file_history_panel` keymap groups.
+
 ### Comparing All the Changes
 
 First, checkout the branch locally. If it's a GitHub PR, you can use

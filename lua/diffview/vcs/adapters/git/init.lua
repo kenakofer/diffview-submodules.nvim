@@ -270,6 +270,62 @@ function GitAdapter:get_show_args(path, rev)
   return utils.vec_join(self:args(), "show", fmt("%s:%s", rev and rev:object_name() or "", path))
 end
 
+---@class git.Gitlink
+---@field sha string
+---@field dirty boolean
+
+---@param path string
+---@param rev Rev
+---@return git.Gitlink?
+---@return string[]? err
+function GitAdapter:get_gitlink(path, rev)
+  local args
+  if rev.type == RevType.COMMIT then
+    args = { "ls-tree", rev.commit, "--", ":(literal)" .. path }
+  elseif rev.type == RevType.STAGE or rev.type == RevType.LOCAL then
+    args = { "ls-files", "--stage", "--", ":(literal)" .. path }
+  else
+    return
+  end
+
+  local out, code, stderr = self:exec_sync(args, { cwd = self.ctx.toplevel })
+  if code ~= 0 then return nil, stderr end
+
+  local sha
+  for _, line in ipairs(out) do
+    if rev.type == RevType.COMMIT then
+      sha = line:match("^160000 commit (%x+)\t")
+    else
+      local hash, stage = line:match("^160000 (%x+) (%d)\t")
+      if tonumber(stage) == (rev.stage or 0) then sha = hash end
+      -- During a gitlink conflict the working tree still belongs to the submodule.
+      if rev.type == RevType.LOCAL and hash and not sha then sha = hash end
+    end
+    if sha then break end
+  end
+  if not sha then return end
+
+  local link = { sha = sha, dirty = false }
+  if rev.type == RevType.LOCAL then
+    local cwd = pl:join(self.ctx.toplevel, path)
+    local stat = pl:stat(cwd)
+    if not stat or stat.type ~= "directory" then return end
+    -- Git would otherwise walk up to the superproject for uninitialized modules.
+    if pl:stat(pl:join(cwd, ".git")) then
+      out, code, stderr = self:exec_sync({ "rev-parse", "--verify", "HEAD" }, { cwd = cwd })
+      if code ~= 0 then return nil, stderr end
+      link.sha = vim.trim(out[1])
+
+      out, code, stderr = self:exec_sync({
+        "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none",
+      }, { cwd = cwd })
+      if code ~= 0 then return nil, stderr end
+      link.dirty = #out > 0
+    end
+  end
+  return link
+end
+
 function GitAdapter:get_log_args(args)
   return utils.vec_join("log", "--first-parent", "--stat", args)
 end
@@ -1707,7 +1763,8 @@ GitAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, op
       "-c",
       "core.quotePath=false",
       "diff",
-      "--ignore-submodules",
+      "--ignore-submodules=none",
+      "--submodule=short",
       "--name-status",
       args
     ),
@@ -1721,7 +1778,8 @@ GitAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, op
       "-c",
       "core.quotePath=false",
       "diff",
-      "--ignore-submodules",
+      "--ignore-submodules=none",
+      "--submodule=short",
       "--numstat",
       args
     ),
@@ -1825,7 +1883,7 @@ GitAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, op
       }
     })
 
-    if left and left.type == RevType.LOCAL then
+    if left and left.type == RevType.LOCAL and file.stats then
       -- Special handling is required here. The rev range `LOCAL..{REV}` can't be
       -- expressed in Git's rev syntax, but logically it should be the same as
       -- just `{REV}`, but with the diff stats swapped (as we want the diff from

@@ -404,6 +404,9 @@ DiffView.update_files = debounce.debounce_trailing(
           end
 
           v.cur_files[ai].status = v.new_files[bi].status
+          for _, file in ipairs(v.cur_files[ai].layout:files()) do
+            if file.submodule then file:dispose_buffer() end
+          end
           v.cur_files[ai]:validate_stage_buffers(index_stat)
 
           if new_head then
