@@ -14,6 +14,13 @@ new Diffview tab without changing the parent view or the global working
 directory. The SHA buffers also display a reminder to press `gs` to open the
 submodule diff in a new tab.
 
+If the checked-out submodule commit differs from the parent index, the
+working-tree SHA buffer displays a warning and the expected SHA. Opening a
+submodule with `gs` also warns if its checkout differs from the expected
+right-hand reference. Working-tree comparisons still use the actual checkout;
+fixed commit comparisons still use the recorded SHAs even if the checkout
+differs. Nothing is checked out automatically.
+
 The new tab compares the referenced commits for staged or historical changes,
 or the left reference against the submodule's working tree for local changes.
 Added/deleted submodules compare against an empty tree; nested submodules use

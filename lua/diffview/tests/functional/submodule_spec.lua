@@ -17,7 +17,7 @@ local await = async.await
 
 describe("submodule reference diffs", function()
   local root, parent, module, adapter, old, new, latest, base, head
-  local errors, original_err
+  local errors, warnings, original_err, original_warn
 
   local function git(cwd, ...)
     local out = vim.fn.systemlist({ "git", "-C", cwd, ... })
@@ -82,12 +82,16 @@ describe("submodule reference diffs", function()
     git(module, "checkout", "--quiet", latest)
     adapter = GitAdapter({ toplevel = parent })
     errors = {}
+    warnings = {}
     original_err = utils.err
+    original_warn = utils.warn
     utils.err = function(message) errors[#errors + 1] = message end
+    utils.warn = function(message) warnings[#warnings + 1] = message end
   end)
 
   after_each(function()
     utils.err = original_err
+    utils.warn = original_warn
     for _, view in ipairs(vim.list_slice(lib.views)) do view:close() end
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_get_name(bufnr):find(root, 1, true) then
@@ -100,9 +104,9 @@ describe("submodule reference diffs", function()
   it("resolves historical, index, local, dirty and ordinary entries", function()
     eq({ sha = old, dirty = false }, adapter:get_gitlink("module with spaces", GitRev(RevType.COMMIT, base)))
     eq({ sha = new, dirty = false }, adapter:get_gitlink("module with spaces", GitRev(RevType.STAGE, 0)))
-    eq({ sha = latest, dirty = false }, adapter:get_gitlink("module with spaces", GitRev(RevType.LOCAL)))
+    eq({ sha = latest, dirty = false, expected_sha = new }, adapter:get_gitlink("module with spaces", GitRev(RevType.LOCAL)))
     write(module .. "/untracked.txt", { "dirty" })
-    eq({ sha = latest, dirty = true }, adapter:get_gitlink("module with spaces", GitRev(RevType.LOCAL)))
+    eq({ sha = latest, dirty = true, expected_sha = new }, adapter:get_gitlink("module with spaces", GitRev(RevType.LOCAL)))
     eq(nil, adapter:get_gitlink("normal.txt", GitRev(RevType.COMMIT, base)))
     eq(nil, adapter:get_gitlink("missing", GitRev(RevType.STAGE, 0)))
   end)
@@ -126,15 +130,24 @@ describe("submodule reference diffs", function()
     for _, item in ipairs({
       { rev = GitRev(RevType.COMMIT, base), line = "Subproject commit " .. old },
       { rev = GitRev(RevType.STAGE, 0), line = "Subproject commit " .. new },
-      { rev = GitRev(RevType.LOCAL), line = "Subproject commit " .. latest .. "-dirty" },
+      { rev = GitRev(RevType.LOCAL), line = "Subproject commit " .. latest .. "-dirty", expected_sha = new },
     }) do
       local file = File({ adapter = adapter, path = "module with spaces", kind = "working", rev = item.rev })
       local bufnr = await(file:create_buffer())
-      eq({
+      local expected_lines = {
         item.line,
         "",
         "Press gs to open the submodule diff in a new tab.",
-      }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+      }
+      if item.expected_sha then
+        vim.list_extend(expected_lines, {
+          "",
+          "WARNING: Submodule checkout differs from the parent index.",
+          "Expected: " .. new,
+          "The submodule diff will use the checked-out working tree.",
+        })
+      end
+      eq(expected_lines, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
       eq(false, vim.bo[bufnr].modifiable)
       eq("nowrite", vim.bo[bufnr].buftype)
       file:destroy()
@@ -171,6 +184,12 @@ describe("submodule reference diffs", function()
     eq(utils.path:normalize(module), utils.path:normalize(child.adapter.ctx.toplevel))
     eq(true, vim.api.nvim_tabpage_is_valid(tab))
     eq(cwd, vim.fn.getcwd())
+    eq({ {
+      "Submodule checkout mismatch: module with spaces",
+      "Checked out: " .. latest,
+      "Expected (right-hand reference): " .. new,
+      "This diff still compares the recorded references, not the checkout.",
+    } }, warnings)
     eq({}, errors)
   end)
 
@@ -180,6 +199,25 @@ describe("submodule reference diffs", function()
     assert(child ~= view)
     eq(new, child.left.commit)
     eq(RevType.LOCAL, child.right.type)
+    eq({ {
+      "Submodule checkout mismatch: module with spaces",
+      "Checked out: " .. latest,
+      "Expected (parent index): " .. new,
+      "This diff uses the checked-out working tree.",
+    } }, warnings)
+    eq({}, errors)
+  end)
+
+  it("keeps fixed comparisons available when the checkout HEAD cannot be resolved", function()
+    git(module, "symbolic-ref", "HEAD", "refs/heads/unborn")
+    local view = open({ base .. ".." .. head, "-C" .. parent })
+    local child = open_submodule()
+    assert(child ~= view)
+    eq(old, child.left.commit)
+    eq(new, child.right.commit)
+    eq(1, #warnings)
+    eq("Unable to verify the submodule checkout: module with spaces", warnings[1][1])
+    eq("This diff still compares the recorded references.", warnings[1][#warnings[1]])
     eq({}, errors)
   end)
 
@@ -194,6 +232,29 @@ describe("submodule reference diffs", function()
     assert(child ~= view)
     eq(new, child.left.commit)
     eq(latest, child.right.commit)
+    eq({ {
+      "Submodule checkout mismatch: module with spaces",
+      "Checked out: " .. old,
+      "Expected (right-hand reference): " .. latest,
+      "This diff still compares the recorded references, not the checkout.",
+    } }, warnings)
+    eq({}, errors)
+  end)
+
+  it("does not warn for matching checkouts, including dirty working trees", function()
+    git(module, "checkout", "--quiet", new)
+    local view = open({ base .. ".." .. head, "-C" .. parent })
+    local child = open_submodule()
+    eq(new, child.right.commit)
+    eq({}, warnings)
+    for _, opened in ipairs(vim.list_slice(lib.views)) do opened:close() end
+
+    write(module .. "/file.txt", { "local edit" })
+    eq({ sha = new, dirty = true }, adapter:get_gitlink("module with spaces", GitRev(RevType.LOCAL)))
+    view = open({ head, "-C" .. parent })
+    child = open_submodule()
+    eq(RevType.LOCAL, child.right.type)
+    eq({}, warnings)
     eq({}, errors)
   end)
 
@@ -242,6 +303,10 @@ describe("submodule reference diffs", function()
       "Subproject commit " .. latest,
       "",
       "Press gs to open the submodule diff in a new tab.",
+      "",
+      "WARNING: Submodule checkout differs from the parent index.",
+      "Expected: " .. new,
+      "The submodule diff will use the checked-out working tree.",
     }, vim.api.nvim_buf_get_lines(file.bufnr, 0, -1, false))
     git(module, "checkout", "--quiet", old)
     local finished = false
@@ -254,9 +319,31 @@ describe("submodule reference diffs", function()
       "Subproject commit " .. old,
       "",
       "Press gs to open the submodule diff in a new tab.",
+      "",
+      "WARNING: Submodule checkout differs from the parent index.",
+      "Expected: " .. new,
+      "The submodule diff will use the checked-out working tree.",
     }, vim.api.nvim_buf_get_lines(file.bufnr, 0, -1, false))
     eq({}, errors)
   end)
+
+  it("refreshes checkout warnings when only the parent index changes", helpers.async_test(function()
+    local file = File({
+      adapter = adapter, path = "module with spaces", kind = "working", rev = GitRev(RevType.LOCAL),
+    })
+    local bufnr = await(file:create_buffer())
+    eq(new, file.submodule.expected_sha)
+    git(parent, "add", "--", "module with spaces")
+    file:dispose_buffer()
+    bufnr = await(file:create_buffer())
+    eq(nil, file.submodule.expected_sha)
+    eq({
+      "Subproject commit " .. latest,
+      "",
+      "Press gs to open the submodule diff in a new tab.",
+    }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+    file:destroy()
+  end))
 
   it("shows references but refuses to enter uninitialized submodules", function()
     git(parent, "submodule", "deinit", "--force", "--", "module with spaces")
@@ -310,6 +397,7 @@ describe("submodule reference diffs", function()
     }, "\n")
     vim.fn.system({ "git", "-C", parent, "update-index", "--index-info" }, input)
     eq(0, vim.v.shell_error)
+    eq(nil, adapter:get_gitlink("module with spaces", GitRev(RevType.LOCAL)).expected_sha)
     local view = open({ "-C" .. parent })
     eq("U", view.cur_entry.status)
     for _, file in ipairs(view.cur_entry.layout:files()) do

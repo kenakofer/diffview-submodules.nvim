@@ -182,11 +182,20 @@ end
 ---@param callback (fun(err?: string[], data?: string[]))
 File.produce_data = async.wrap(function(self, callback)
   if self.submodule then
-    callback(nil, {
+    local lines = {
       "Subproject commit " .. self.submodule.sha .. (self.submodule.dirty and "-dirty" or ""),
       "",
       "Press gs to open the submodule diff in a new tab.",
-    })
+    }
+    if self.submodule.expected_sha then
+      utils.vec_push(lines,
+        "",
+        "WARNING: Submodule checkout differs from the parent index.",
+        "Expected: " .. self.submodule.expected_sha,
+        "The submodule diff will use the checked-out working tree."
+      )
+    end
+    callback(nil, lines)
   elseif self.get_data and vim.is_callable(self.get_data) then
     local pos = self.symbol == "a" and "left" or "right"
     local data = self.get_data(self.kind, self.path, pos)
@@ -258,6 +267,9 @@ File.create_buffer = async.wrap(function(self, callback)
   end
   if self.submodule then
     context = context .. "/" .. self.submodule.sha .. (self.submodule.dirty and "-dirty" or "")
+    if self.submodule.expected_sha then
+      context = context .. "-expected-" .. self.submodule.expected_sha
+    end
   end
 
   local fullname = pl:join("diffview://", self.adapter.ctx.dir, context, self.path)

@@ -221,8 +221,39 @@ function M.open_submodule()
   if file.revs.b.type ~= RevType.LOCAL or not right then
     rev_arg = rev_arg .. ".." .. (right and right.sha or null_tree)
   end
+  local warning
+  if right then
+    local is_local = file.revs.b.type == RevType.LOCAL
+    local expected_sha = right.sha
+    if is_local then expected_sha = right.expected_sha end
+    local checkout_sha = right.sha
+    if not is_local then
+      local out, code, stderr = adapter:exec_sync({ "rev-parse", "--verify", "HEAD" }, { cwd = cwd })
+      if code ~= 0 then
+        warning = utils.vec_join(
+          "Unable to verify the submodule checkout: " .. file.path,
+          stderr,
+          "This diff still compares the recorded references."
+        )
+        checkout_sha = nil
+      else
+        checkout_sha = vim.trim(out[1])
+      end
+    end
+    if expected_sha and checkout_sha and checkout_sha ~= expected_sha then
+      warning = {
+        "Submodule checkout mismatch: " .. file.path,
+        "Checked out: " .. checkout_sha,
+        "Expected (" .. (is_local and "parent index" or "right-hand reference") .. "): " .. expected_sha,
+        is_local and "This diff uses the checked-out working tree."
+          or "This diff still compares the recorded references, not the checkout.",
+      }
+    end
+  end
   local subview = lib.diffview_open({ rev_arg, "-C" .. cwd })
-  if subview then subview:open() end
+  if not subview then return end
+  subview:open()
+  if warning then utils.warn(warning, true) end
 end
 
 ---@class diffview.ConflictCount

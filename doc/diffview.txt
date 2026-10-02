@@ -1049,6 +1049,13 @@ open_submodule                                  *diffview-actions-open_submodule
         the submodule's files. Each SHA buffer includes a reminder to press `gs`
         to open the submodule diff in a new tab.
 
+        A working-tree SHA buffer warns when the checkout differs from the
+        parent index, showing the expected SHA. Opening the submodule also
+        warns when the checkout differs from the expected right-hand reference.
+        Working-tree comparisons use the actual checkout; fixed comparisons
+        still use the recorded SHAs. These warnings never change the checkout
+        or the compared revisions.
+
         Committed and staged entries compare the two referenced commits.
         Working-tree entries compare the left reference against the submodule's
         working tree, including staged and unstaged changes. Added and deleted

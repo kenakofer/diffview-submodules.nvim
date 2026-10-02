@@ -273,6 +273,7 @@ end
 ---@class git.Gitlink
 ---@field sha string
 ---@field dirty boolean
+---@field expected_sha? string # Parent index reference, when the local checkout differs.
 
 ---@param path string
 ---@param rev Rev
@@ -291,13 +292,16 @@ function GitAdapter:get_gitlink(path, rev)
   local out, code, stderr = self:exec_sync(args, { cwd = self.ctx.toplevel })
   if code ~= 0 then return nil, stderr end
 
-  local sha
+  local sha, index_sha
   for _, line in ipairs(out) do
     if rev.type == RevType.COMMIT then
       sha = line:match("^160000 commit (%x+)\t")
     else
       local hash, stage = line:match("^160000 (%x+) (%d)\t")
-      if tonumber(stage) == (rev.stage or 0) then sha = hash end
+      if tonumber(stage) == (rev.stage or 0) then
+        sha = hash
+        if rev.type == RevType.LOCAL then index_sha = hash end
+      end
       -- During a gitlink conflict the working tree still belongs to the submodule.
       if rev.type == RevType.LOCAL and hash and not sha then sha = hash end
     end
@@ -315,6 +319,7 @@ function GitAdapter:get_gitlink(path, rev)
       out, code, stderr = self:exec_sync({ "rev-parse", "--verify", "HEAD" }, { cwd = cwd })
       if code ~= 0 then return nil, stderr end
       link.sha = vim.trim(out[1])
+      if index_sha and link.sha ~= index_sha then link.expected_sha = index_sha end
 
       out, code, stderr = self:exec_sync({
         "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none",
